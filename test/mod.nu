@@ -28,9 +28,9 @@ const ROW: string = '#TEST-ROW#'
 # `test tests/suites | where status == fail`.
 export def main [
   path: path = tests/suites # A suite file or a directory of suite files
-  --include (-i): string = '.+' # Only run suites whose basename matches
-  --test (-t): string = '' # Only run tests whose command name matches
-  --isolation: string = test # Interpreter per 'test' (hermetic) or per 'suite' (fast)
+  --include (-i): string@_suite-stems = '.+' # Only run suites whose basename matches
+  --test (-t): string@_test-names = '' # Only run tests whose command name matches
+  --isolation: string@_isolation = test # Interpreter per 'test' (hermetic) or per 'suite' (fast)
   --verbose (-v) # Print captured errors under failing tests
   --strict (-s) # Raise an error when any test fails, for CI and hooks
 ]: nothing -> table {
@@ -211,4 +211,40 @@ def summarize [results: table, strict: bool]: nothing -> nothing {
   if $strict and $failures > 0 {
     error make --unspanned $"($failures) test\(s) failed"
   }
+}
+
+## Completions
+
+# Resolve the suite files visible to the command line being completed:
+# the first existing path token, or the `path` argument's default.
+def _suites-on-line [context: string]: nothing -> list<path> {
+  let path: any = $context
+    | split row --regex '\s+'
+    # `drop nth 0` sheds the command token; the module's own `skip` shadows
+    # the core command of that name here.
+    | drop nth 0
+    | compact --empty
+    | where $it !~ '^-' and ($it | path exists)
+    | get --optional 0
+    | default tests/suites
+  match ($path | path type) {
+    dir => (glob ($path | path join *.nu) | sort)
+    file => [$path]
+    _ => []
+  }
+}
+
+def _suite-stems [context: string]: nothing -> list<string> {
+  _suites-on-line $context | each { path parse | get stem }
+}
+
+def _test-names [context: string]: nothing -> list<string> {
+  _suites-on-line $context
+  | each { open $in | parse --regex 'def "(?<name>test [^"]+)"' | get name }
+  | flatten
+  | sort
+}
+
+def _isolation []: nothing -> list<string> {
+  [test suite]
 }
