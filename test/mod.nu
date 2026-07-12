@@ -69,7 +69,9 @@ export def main [
 
 # Abort the current test, reporting it as skipped instead of failed.
 # For runtime conditions: a missing external tool, absent credentials, ...
-export def skip [reason: string]: nothing -> error {
+export def skip [
+  reason: string # Why the test cannot run here; rendered in the skip report
+]: nothing -> error {
   error make --unspanned $"SKIP: ($reason)"
 }
 
@@ -77,7 +79,9 @@ export def skip [reason: string]: nothing -> error {
 #
 # The closure receives {root, home, data, code}: the seam record `sandboxed`
 # uses to redirect a child interpreter's $nu.home-dir and $nu.data-dir.
-export def with-sandbox [action: closure]: nothing -> oneof<nothing, any> {
+export def with-sandbox [
+  action: closure # Receives the sandbox context record {root, home, data, code}
+]: nothing -> oneof<nothing, any> {
   let root: path = mktemp --directory --tmpdir test-sandbox-XXXXXX
   let ctx: record = {
     root: $root
