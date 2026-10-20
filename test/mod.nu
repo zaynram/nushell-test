@@ -151,9 +151,9 @@ def snippet [name: string, hooks: record]: nothing -> string {
   r#'do {
   let start = date now
   let row = try {
-    let ctx = do { %BEFORE% }
+    let ctx = do --env { %BEFORE% }
     $ctx | %NAME%
-    do { %AFTER% } | ignore
+    do --env { %AFTER% } | ignore
     {name: %QNAME%, status: 'ok', error: null}
   } catch {|e|
     let status = if ($e.msg | str starts-with 'SKIP: ') { 'skip' } else { 'fail' }
