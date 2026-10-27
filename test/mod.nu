@@ -19,12 +19,21 @@
 # nu-lint-ignore-file: chained_str_transform
 # ---
 
+use std-rfc/pb
 use std-rfc/kv [ "kv get" "kv set" "kv list" "kv drop" ]
 
 # Marks a result row on a child's stdout; test prints pass through untagged.
 const ROW: string = '#TEST-ROW#'
 const KV: string = 'test_config'
-const BIN: path = path self ../scripts | path expand --strict
+const BIN: path = path self scripts | path expand --strict
+const ROLES: list<string> = [
+  test
+  ignore
+  before-each
+  after-each
+  before-all
+  after-all
+]
 
 # Register directories to be included in the `--include-path` of Nushell test subprocesses.
 export def add-lib [
@@ -43,44 +52,70 @@ export def add-lib [
 # Progress renders on stderr; the return value is pure data, so it pipes:
 # `test tests/suites | where status == fail`.
 export def main [
-  path: path = tests/suites # A suite file or a directory of suite files
+  path?: directory # A suite file or a directory of suite files
   --include (-i): string@_suite-stems = '.+' # Only run suites whose basename matches
   --test (-t): string@_test-names = '' # Only run tests whose command name matches
   --isolation: string@_isolation = test # Interpreter per 'test' (hermetic) or per 'suite' (fast)
   --verbose (-v) # Print captured errors under failing tests
+  --debug (-d) # Print debug information (useful for collection errors)
   --strict (-s) # Raise an error when any test fails, for CI and hooks
 ]: nothing -> table {
   if $isolation not-in [test suite] {
     error make --unspanned $"--isolation must be 'test' or 'suite', got '($isolation)'"
   }
-  let suites: list<path> = $path | path expand
-    | if ($in | path type) == dir { glob ($in | path join *.nu) } else { [$in] }
+  let suites: list<path> = $path
+    | default ($env.pwd! | path join tests suites)
+    | if $debug { debug echo 'suites-root' } else { }
+    | try { path expand --strict } catch { error make 'unable to resolve test suites directory' }
+    | match ($in | path type) { dir => (try { glob ($in | path join *.nu) }) _ => ([$in]) }
+    | default []
     | where ($it | path basename) =~ $include
+    | if $debug { debug echo 'discovered-suites' } else { }
   let results: table = $suites | each {|suite|
       print --stderr $"(ansi dark_gray_bold)[(ansi rst)(ansi cyan_bold)($suite | path parse | get stem)(ansi rst)(ansi dark_gray_bold)](ansi rst)"
       let cmds: table = discover $suite
-      let hooks: record = {
-        before: ($cmds | where role == before-each | get --optional 0.name)
-        after: ($cmds | where role == after-each | get --optional 0.name)
-      }
-      let wanted: table = $cmds | where role == test
-        | if $test == '' { $in } else { where name =~ $test }
+      let stem: string = $suite | path parse | get $.stem
+      let hooks: record = $cmds
+        | reject $.ignore
+        | group-by --to-table --prune role
+        | select $.role $.items.name
+        | transpose --ignore-titles --header-row --as-record
+        | default [] before-each after-each before-all after-all
+      let wanted: table = $cmds | where role == test | if $test != '' { where name =~ $test } else { }
       # Ignored tests surface as skips: invisible skips read as coverage.
-      let ignored: table = $wanted | where $it.ignore | each {|c|
-          {name: $c.name status: skip error: 'ignored at discovery' duration: 0sec}
+      let ignored: table = $wanted
+        | where $it.ignore
+        | select $.name
+        | par-each --keep-order {
+          let row = merge {status: skip error: 'ignored at discovery' duration: 0ms}
+          render $row $verbose
+          $row
         }
       let names: list = $wanted | where not $it.ignore | get name
+      let count: int = $names | length
       let ran: table = match $isolation {
-        test => ($names | each {|n| spawn $suite (snippet $n $hooks) } | flatten)
-        suite => (spawn $suite ...($names | each {|n| snippet $n $hooks }))
+        test => {
+          $names | enumerate | each --flatten {|row|
+            pb set-idx $row.index $count
+            let res = spawn $suite ($hooks | snippet $row.item)
+            for row in $res { render $row $verbose }
+            $res
+          }
+        }
+        suite => {
+          pb set 0
+          let all: list<string> = $names | par-each --keep-order {|n| $hooks | snippet $n }
+          let res = spawn $suite ...$all
+          pb set 100
+          for row in $res { render $row $verbose }
+          $res
+        }
       }
-      $ran | append $ignored | each {|row|
-        render $row $verbose
-        $row | insert suite ($suite | path parse | get stem)
-      }
+      [...$ran ...$ignored] | insert $.suite $stem
     } | flatten
+  pb clear
   summarize $results $strict
-  $results | select suite name status duration error
+  $results | select $.suite $.name $.status $.duration $.error
 }
 
 # Abort the current test, reporting it as skipped instead of failed.
@@ -135,43 +170,80 @@ export def sandboxed [
 
 # ——— utilities ————————————————————————————————————————————————————————————————
 
+def "debug echo" [label: string]: oneof<nothing, any> -> oneof<nothing, any> {
+  debug | print $"(ansi y)[debug](ansi rst) ($label): ($in)"; return $in
+}
+
 # Enumerate a suite's commands and their roles in a child interpreter.
-def discover [suite: path]: nothing -> table {
-  const p: path = $BIN | path join probe.nu
-  let script: string = [
-    $"source ($suite | to nuon)"
-    $"run ($BIN | path join probe.nu) | to nuon | print"
-  ] | str join '; '
-  subprocess $script | match $in.exit_code {
-    0 => (get $.stdout | from nuon)
-    _ => {
-      let help: string = get $.stderr | str trim
-      let name: string = $suite | path basename
-      error make --unspanned {msg: $"suite '($name)' failed to load" help: $help}
-    }
-  }
+export def discover [
+  suite: path # Path to a test suite to source
+]: nothing -> table<name: string, role: string, ignore: bool> {
+  let commands: string = (
+    $"source '($suite)'; "
+    + r#'scope commands
+      | where type == custom
+      | select $.name $.description $.attributes.name?
+      | rename --column={attributes.name: attrs}
+      | to nuon --serialize
+      '#
+  )
+  subprocess --pipe $commands
+  | rename --column={attributes.name: attrs}
+  | par-each --keep-order {|c|
+    | insert $.role {|row|
+      match ($row.name | split words | take 2) {
+        [test _] => 'test'
+        [$x $y] if [before after] has $x and [each all] has $y => $'($x)-($y)'
+        _ => ($row.attrs | where $ROLES has $it | first)
+      } | default 'none'
+    } | insert $.ignore ($in.description =~ '(?i)^\s*ignore' or 'ignore' in $in.attrs)
+    | select $.name $.role $.ignore
+  } | where role != 'none'
+  | reverse
 }
 
 # Generate the child program fragment that runs one test and emits its row.
 # The test's literal name is interpolated in: strings don't invoke, names do.
-def snippet [name: string hooks: record]: nothing -> string {
-  $hooks | upsert $.after {||
-    match ($in | describe) { nothing => 'null' string => $'$ctx | ($in)' }
-  } | default 'null' before
-  | merge {qname: ($name | to nuon) name: $name row: $ROW}
+export def snippet [name: string]: record -> string {
+  {
+    name: $name
+    qname: ($name | to nuon)
+    row: $ROW
+    setup: ($in.before-all | str join '; ')
+    before: ($in.before-each | prepend '$ctx' | str join ' | ')
+    after: ($in.after-each | prepend '$ctx' | str join ' | ')
+    cleanup: ($in.after-all | str join '; ')
+  }
   | format pattern r#'do {{
   let start = date now
+  let ctx = do --env {{ {setup} }}
   let row = try {{
     let ctx = do --env {{ {before} }}
     $ctx | {name}
     do --env {{ after }} | ignore
-    {name: {qname}, status: 'ok', error: null}
+    {{name: {qname}, status: 'ok', error: null}}
   }} catch {{|e|
-    let status = if ($e.msg | str starts-with 'SKIP: ') {{ 'skip' }} else {{ 'fail' }}
-    {name: {qname}, status: $status, error: ($e.rendered? | default $e.msg)}
+    {{
+      name: {qname}
+      status: (if $e.msg starts-with 'SKIP: ' {{ 'skip' }} else {{ 'fail' }})
+      error: (
+        match $e {{
+          {{rendered: $r}} => (
+            $r | lines | let ls
+            | where $it starts-with snippet
+            | str trim
+            | compact --empty
+            | str join (char newline)
+            | prepend ($ls | take 1 | str replace 'Error' 'reason')
+          )
+          _ => $e.msg
+        }}
+      )
+    }}
   }}
   let elapsed: duration = (date now) - $start
   print $"{row}($row | merge {{duration: $elapsed}} | to nuon | encode base64)"
+  do --env {{ {cleanup} }} | ignore
 }}'#
 }
 
@@ -203,13 +275,13 @@ def render [row: record verbose: bool]: nothing -> nothing {
     ($row.name | str replace --regex '^test ' '')
     $" (ansi attr_dimmed)($row.duration)(ansi rst)"
   ] | str join
-  | print --stderr
+  | print --stderr $in
   if $verbose and $row.status in [fail error] and $row.error != null {
     $row.error
     | lines
     | par-each --keep-order { $"    ($in)" }
     | str join (char newline)
-    | print --stderr
+    | print --stderr $in
   }
 }
 
@@ -223,18 +295,22 @@ def summarize [results: table strict: bool]: nothing -> nothing {
     $"(ansi yellow)(do $count skip) skipped(ansi rst)"
     $"(ansi attr_dimmed)in ($total)(ansi rst)"
   ] | str join ', '
-  | print --stderr
+  | print --stderr $in
   if $strict and $errors > 0 { error make --unspanned $"($errors) test\(s) failed" }
 }
 
-def subprocess [
+export def subprocess [
   commands: string
-]: nothing -> record<stdout: string, stderr: string, exit_code: int> {
-  let include_path: string = kv get --table=$KV include_path
-    | match ($in | describe) { nothing => '' string => () }
-  do --capture-errors {
-    ^$nu.current-exe --no-config-file --include-path=($include_path) --commands=($commands)
-  } | complete
+  --pipe # Attempt to deserialize stdout (raises an error for non-zero exit codes)
+]: nothing -> oneof<record<stdout: string, stderr: string, exit_code: int>, list, table, string, number, nothing> {
+  let include_path: string = kv get --table=$KV include_path | default ('')
+  ^$nu.current-exe --table-mode=none --error-style=plain --no-config-file --include-path=($include_path) --commands=($commands)
+  | complete
+  | match $in.exit_code {
+    _ if not $pipe => ()
+    0 => (get $.stdout | from nuon)
+    $c => { error make --unspanned {msg: $'subprocess exited with code ($c)' help: $in.stderr} }
+  }
 }
 
 # ——— completions ——————————————————————————————————————————————————————————————

@@ -1,1 +1,1 @@
-{name: test description: "Custom implementation of a Nushell testing framework" type: module license: MIT version: "0.1.1"}
+{name: test description: "Custom implementation of a Nushell testing framework" type: module license: MIT version: "0.1.2"}
