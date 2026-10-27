@@ -25,7 +25,6 @@ use std-rfc/kv [ "kv get" "kv set" "kv list" "kv drop" ]
 # Marks a result row on a child's stdout; test prints pass through untagged.
 const ROW: string = '#TEST-ROW#'
 const KV: string = 'test_config'
-const BIN: path = path self scripts | path expand --strict
 const ROLES: list<string> = [
   test
   ignore
